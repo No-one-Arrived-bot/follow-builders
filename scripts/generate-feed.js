@@ -87,7 +87,7 @@ async function fetchAssemblyAITranscript(audioUrl, apiKey) {
     let res = await fetch(`${ASSEMBLYAI_BASE}/transcript`, {
       method: 'POST',
       headers: { 'authorization': apiKey, 'content-type': 'application/json' },
-      body: JSON.stringify({ audio_url: audioUrl })
+      body: JSON.stringify({ audio_url: audioUrl, speech_model: 'universal-2' })
     });
     let data = await res.json();
     if (data.error) return { error: data.error };
@@ -213,14 +213,26 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
     const data = await datasetRes.json();
     console.error(`  Apify returned ${data.length} raw tweets`);
 
-    // 4. Group by author
+    // 4. Group by author — try multiple field paths for robustness
+    if (data.length > 0) {
+      const sample = data[0];
+      const authorKeys = Object.keys(sample.author || sample.user || {});
+      console.error(`  Apify sample author keys: ${authorKeys.join(", ")}`);
+    }
     const tweetsByAuthor = {};
     for (const t of data) {
-      const handle = t.author?.userName?.toLowerCase();
+      const handle = (
+        t.author?.userName ||
+        t.author?.username ||
+        t.user?.screen_name ||
+        t.user?.userName ||
+        (t.twitterUrl || t.url || "").split("/")[3]
+      )?.toLowerCase();
       if (!handle) continue;
       if (!tweetsByAuthor[handle]) tweetsByAuthor[handle] = [];
       tweetsByAuthor[handle].push(t);
     }
+    console.error(`  Matched handles: ${Object.keys(tweetsByAuthor).slice(0, 5).join(", ") || "none"}`);
 
     // 5. Filter and build output per account
     for (const account of xAccounts) {
