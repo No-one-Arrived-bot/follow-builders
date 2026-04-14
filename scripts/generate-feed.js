@@ -15,14 +15,12 @@ import { join } from 'path';
 
 // -- Constants ---------------------------------------------------------------
 const ASSEMBLYAI_BASE = 'https://api.assemblyai.com/v2';
-const APIFY_ACTOR_URL = 'https://api.apify.com/v2/acts/apidojo~tweet-scraper/run-sync-get-dataset-items';
+const APIFY_RUN_URL = 'https://api.apify.com/v2/acts/apidojo~tweet-scraper/runs';
 const RSS_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 const TWEET_LOOKBACK_HOURS = 24;
-const PODCAST_LOOKBACK_HOURS = 336; 
-const BLOG_LOOKBACK_HOURS = 72;
+const PODCAST_LOOKBACK_HOURS = 336;
 const MAX_TWEETS_PER_USER = 3;
-const MAX_ARTICLES_PER_BLOG = 3;
 
 const SCRIPT_DIR = decodeURIComponent(new URL('.', import.meta.url).pathname);
 const STATE_PATH = join(SCRIPT_DIR, '..', 'state-feed.json');
@@ -52,7 +50,7 @@ async function loadSources() {
   return JSON.parse(await readFile(sourcesPath, 'utf-8'));
 }
 
-// -- Podcast Fetching (AssemblyAI) ----------------------------------------
+// -- Podcast Fetching (RSS + AssemblyAI) -------------------------------------
 function parseRssFeed(xml) {
   const episodes = [];
   const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
@@ -72,7 +70,7 @@ function parseRssFeed(xml) {
     const linkMatch = block.match(/<link>([\s\S]*?)<\/link>/);
     const link = linkMatch ? linkMatch[1].trim() : null;
 
-    // VERY IMPORTANT: Extract the actual mp3 audio url for AssemblyAI
+    // Extract mp3 audio URL from <enclosure> tag for AssemblyAI
     const enclosureMatch = block.match(/<enclosure[^>]*url="([^"]+)"/i);
     const audioUrl = enclosureMatch ? enclosureMatch[1].trim() : null;
 
@@ -95,15 +93,16 @@ async function fetchAssemblyAITranscript(audioUrl, apiKey) {
     if (data.error) return { error: data.error };
     const transcriptId = data.id;
 
-    // 2. Poll for completion (Max ~3 mins)
+    // 2. Poll for completion (max ~3 mins, 20 attempts × 10s)
     for (let i = 0; i < 20; i++) {
-      await new Promise(r => setTimeout(r, 10000)); 
-      res = await fetch(`${ASSEMBLYAI_BASE}/transcript/${transcriptId}`, { headers: { 'authorization': apiKey } });
+      await new Promise(r => setTimeout(r, 10000));
+      res = await fetch(`${ASSEMBLYAI_BASE}/transcript/${transcriptId}`, {
+        headers: { 'authorization': apiKey }
+      });
       data = await res.json();
-      
       if (data.status === 'completed') return { transcript: data.text };
       if (data.status === 'error') return { error: data.error };
-      console.error(`      AssemblyAI: processing (${i+1}/20)...`);
+      console.error(`      AssemblyAI: processing (${i + 1}/20)...`);
     }
     return { error: 'Timeout waiting for transcript' };
   } catch (err) {
@@ -123,9 +122,13 @@ async function fetchPodcastContent(podcasts, apiKey, state, errors) {
         headers: { 'User-Agent': RSS_USER_AGENT },
         signal: AbortSignal.timeout(30000)
       });
-      if (!rssRes.ok) continue;
+      if (!rssRes.ok) {
+        console.error(`    RSS fetch failed: HTTP ${rssRes.status}`);
+        continue;
+      }
       const episodes = parseRssFeed(await rssRes.text());
-      
+      console.error(`    Parsed ${episodes.length} episodes with audio URLs`);
+
       for (const episode of episodes.slice(0, 3)) {
         if (state.seenVideos[episode.guid]) continue;
         allCandidates.push({ podcast, ...episode });
@@ -137,7 +140,9 @@ async function fetchPodcastContent(podcasts, apiKey, state, errors) {
 
   const withinWindow = allCandidates
     .filter(v => !v.publishedAt || new Date(v.publishedAt) >= cutoff)
-    .sort((a, b) => (new Date(b.publishedAt) - new Date(a.publishedAt)));
+    .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
+
+  console.error(`  ${withinWindow.length} episode(s) within ${PODCAST_LOOKBACK_HOURS}h window`);
 
   for (const selected of withinWindow) {
     console.error(`    Fetching transcript via AssemblyAI for "${selected.title}"...`);
@@ -145,7 +150,7 @@ async function fetchPodcastContent(podcasts, apiKey, state, errors) {
     state.seenVideos[selected.guid] = Date.now();
 
     if (result.error || !result.transcript) {
-      console.error(`    Transcript error or empty, skipping...`);
+      console.error(`    Transcript error: ${result.error || 'empty'}, skipping...`);
       continue;
     }
 
@@ -162,27 +167,53 @@ async function fetchPodcastContent(podcasts, apiKey, state, errors) {
   return [];
 }
 
-// -- X/Twitter Fetching (Apify Scraper) ------------------------------------
+// -- X/Twitter Fetching (Apify async run) ------------------------------------
 async function fetchXContent(xAccounts, apifyToken, state, errors) {
   const results = [];
   const cutoff = new Date(Date.now() - TWEET_LOOKBACK_HOURS * 60 * 60 * 1000);
   const handles = xAccounts.map(a => a.handle);
 
   try {
+    // 1. Submit async run to Apify
     console.error(`  Triggering Apify Twitter Scraper for ${handles.length} handles...`);
-    const res = await fetch(`${APIFY_ACTOR_URL}?token=${apifyToken}`, {
+    const runRes = await fetch(`${APIFY_RUN_URL}?token=${apifyToken}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         twitterHandles: handles,
-        maxItems: handles.length * 5 
+        maxItems: handles.length * 5
       })
     });
 
-    if (!res.ok) throw new Error(`Apify request failed with status ${res.status}`);
-    const data = await res.json();
-    
-    // Group scraped tweets by author
+    if (!runRes.ok) throw new Error(`Apify run start failed: HTTP ${runRes.status}`);
+    const runData = await runRes.json();
+    const runId = runData.data?.id;
+    if (!runId) throw new Error('Apify did not return a run ID');
+    console.error(`  Apify run started: ${runId}`);
+
+    // 2. Poll for run completion (max ~5 mins, 30 attempts × 10s)
+    let status = 'RUNNING';
+    for (let i = 0; i < 30 && (status === 'RUNNING' || status === 'READY'); i++) {
+      await new Promise(r => setTimeout(r, 10000));
+      const statusRes = await fetch(
+        `https://api.apify.com/v2/actor-runs/${runId}?token=${apifyToken}`
+      );
+      const statusData = await statusRes.json();
+      status = statusData.data?.status;
+      console.error(`    Apify status: ${status} (${i + 1}/30)`);
+    }
+
+    if (status !== 'SUCCEEDED') throw new Error(`Apify run ended with status: ${status}`);
+
+    // 3. Fetch dataset results
+    const datasetRes = await fetch(
+      `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${apifyToken}`
+    );
+    if (!datasetRes.ok) throw new Error(`Failed to fetch Apify dataset: HTTP ${datasetRes.status}`);
+    const data = await datasetRes.json();
+    console.error(`  Apify returned ${data.length} raw tweets`);
+
+    // 4. Group by author
     const tweetsByAuthor = {};
     for (const t of data) {
       const handle = t.author?.userName?.toLowerCase();
@@ -191,6 +222,7 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
       tweetsByAuthor[handle].push(t);
     }
 
+    // 5. Filter and build output per account
     for (const account of xAccounts) {
       const handleLower = account.handle.toLowerCase();
       const allTweets = tweetsByAuthor[handleLower] || [];
@@ -199,8 +231,8 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
       for (const t of allTweets) {
         if (state.seenTweets[t.id]) continue;
         if (new Date(t.createdAt) < cutoff) continue;
-        if (newTweets.length >= MAX_TWEETS_PER_USER) break;
         if (t.isRetweet || t.isReply) continue;
+        if (newTweets.length >= MAX_TWEETS_PER_USER) break;
 
         newTweets.push({
           id: t.id,
@@ -228,20 +260,10 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
     }
   } catch (err) {
     errors.push(`Apify Twitter fetch error: ${err.message}`);
+    console.error(`  Apify error: ${err.message}`);
   }
 
   return results;
-}
-
-// -- Blog Fetching (Unchanged) -------------------------------------------
-function parseAnthropicEngineeringIndex(html) { /* same logic */ return []; }
-function parseClaudeBlogIndex(html) { /* same logic */ return []; }
-function extractAnthropicArticleContent(html) { return { content: "Extracted Blog Content" }; }
-function extractClaudeBlogArticleContent(html) { return { content: "Extracted Blog Content" }; }
-
-async function fetchBlogContent(blogs, state, errors) {
-  // Logic simplified here for brevity, assumes original scraping code still works as it uses no dead APIs
-  return [];
 }
 
 // -- Main --------------------------------------------------------------------
@@ -253,19 +275,12 @@ async function main() {
 
   const runTweets = tweetsOnly || (!podcastsOnly && !blogsOnly);
   const runPodcasts = podcastsOnly || (!tweetsOnly && !blogsOnly);
-  const runBlogs = blogsOnly || (!tweetsOnly && !podcastsOnly);
 
   const apifyToken = process.env.APIFY_API_TOKEN;
   const assemblyaiKey = process.env.ASSEMBLYAI_API_KEY;
 
-  if (runPodcasts && !assemblyaiKey) {
-    console.error('ASSEMBLYAI_API_KEY not set');
-    process.exit(1);
-  }
-  if (runTweets && !apifyToken) {
-    console.error('APIFY_API_TOKEN not set');
-    process.exit(1);
-  }
+  if (runTweets && !apifyToken) { console.error('APIFY_API_TOKEN not set'); process.exit(1); }
+  if (runPodcasts && !assemblyaiKey) { console.error('ASSEMBLYAI_API_KEY not set'); process.exit(1); }
 
   const sources = await loadSources();
   const state = await loadState();
@@ -275,7 +290,13 @@ async function main() {
     console.error('Fetching X/Twitter content via Apify...');
     const xContent = await fetchXContent(sources.x_accounts, apifyToken, state, errors);
     const totalTweets = xContent.reduce((sum, a) => sum + a.tweets.length, 0);
-    const xFeed = { generatedAt: new Date().toISOString(), lookbackHours: TWEET_LOOKBACK_HOURS, x: xContent, stats: { xBuilders: xContent.length, totalTweets } };
+    const xFeed = {
+      generatedAt: new Date().toISOString(),
+      lookbackHours: TWEET_LOOKBACK_HOURS,
+      x: xContent,
+      stats: { xBuilders: xContent.length, totalTweets },
+      errors: errors.filter(e => e.startsWith('Apify'))
+    };
     await writeFile(join(SCRIPT_DIR, '..', 'feed-x.json'), JSON.stringify(xFeed, null, 2));
     console.error(`  feed-x.json: ${xContent.length} builders, ${totalTweets} tweets`);
   }
@@ -283,12 +304,23 @@ async function main() {
   if (runPodcasts) {
     console.error('Fetching podcast content via AssemblyAI...');
     const podcasts = await fetchPodcastContent(sources.podcasts, assemblyaiKey, state, errors);
-    const podcastFeed = { generatedAt: new Date().toISOString(), lookbackHours: PODCAST_LOOKBACK_HOURS, podcasts, stats: { podcastEpisodes: podcasts.length } };
+    const podcastFeed = {
+      generatedAt: new Date().toISOString(),
+      lookbackHours: PODCAST_LOOKBACK_HOURS,
+      podcasts,
+      stats: { podcastEpisodes: podcasts.length },
+      errors: errors.filter(e => e.startsWith('Podcast'))
+    };
     await writeFile(join(SCRIPT_DIR, '..', 'feed-podcasts.json'), JSON.stringify(podcastFeed, null, 2));
     console.error(`  feed-podcasts.json: ${podcasts.length} episodes`);
   }
 
   await saveState(state);
+
+  if (errors.length > 0) {
+    console.error(`\n${errors.length} non-fatal error(s):`);
+    errors.forEach(e => console.error(`  - ${e}`));
+  }
 }
 
 main().catch(err => {
