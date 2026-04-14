@@ -1,5 +1,7 @@
 {
   "seenTweets": {},
-  "seenVideos": {},
+  "seenVideos": {
+    "65d389a8-3765-11f1-a29e-cf3fbe697ce7": 1776171090650
+  },
   "seenArticles": {}
 }
