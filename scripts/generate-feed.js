@@ -85,7 +85,7 @@ async function fetchAssemblyAITranscript(audioUrl, apiKey) {
     const submitRes = await fetch(`${ASSEMBLYAI_BASE}/transcript`, {
       method: 'POST',
       headers: { 'authorization': apiKey, 'content-type': 'application/json' },
-      body: JSON.stringify({ audio_url: audioUrl, speech_model: 'universal-2' })
+      body: JSON.stringify({ audio_url: audioUrl, speech_models: ['universal-2'] })
     });
     const submitData = await submitRes.json();
     if (submitData.error) return { error: submitData.error };
@@ -196,7 +196,11 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
     const runRes = await fetch(`${APIFY_RUN_URL}?token=${apifyToken}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ twitterHandles: handles, maxItems: handles.length * 5 })
+      body: JSON.stringify({
+        startUrls: handles.map(h => ({ url: `https://x.com/${h}` })),
+        maxItems: handles.length * 5,
+        addUserInfo: true
+      })
     });
 
     if (!runRes.ok) throw new Error(`Apify run start failed: HTTP ${runRes.status}`);
@@ -222,19 +226,20 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
     );
     if (!datasetRes.ok) throw new Error(`Failed to fetch Apify dataset: HTTP ${datasetRes.status}`);
     const data = await datasetRes.json();
-    console.error(`  Apify returned ${data.length} raw tweets`);
+    // Filter out placeholder {noResults: true} objects
+    const realTweets = data.filter(t => !t.noResults && (t.url || t.twitterUrl || t.tweetUrl || t.id));
+    console.error(`  Apify returned ${data.length} items, ${realTweets.length} real tweets`);
 
-    // Debug: show structure of first tweet to aid future debugging
-    if (data.length > 0) {
-      const s = data[0];
+    if (realTweets.length > 0) {
+      const s = realTweets[0];
       console.error(`  Sample top-level keys: ${Object.keys(s).join(', ')}`);
-      console.error(`  Sample url field: ${s.url || s.twitterUrl || s.tweetUrl || '(none)'}`);
-      console.error(`  Sample handle extracted: ${extractHandleFromUrl(s) || '(failed)'}`);
+      console.error(`  Sample url: ${s.url || s.twitterUrl || s.tweetUrl || '(none)'}`);
+      console.error(`  Sample handle: ${extractHandleFromUrl(s) || '(failed)'}`);
     }
 
     // Group by handle extracted from tweet URL
     const tweetsByHandle = {};
-    for (const t of data) {
+    for (const t of realTweets) {
       const handle = extractHandleFromUrl(t);
       if (!handle) continue;
       if (!tweetsByHandle[handle]) tweetsByHandle[handle] = [];
