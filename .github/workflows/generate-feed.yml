@@ -38,7 +38,7 @@ jobs:
       - name: Generate feeds
         env:
           APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
-          ASSEMBLYAI_API_KEY: ${{ secrets.ASSEMBLYAI_API_KEY }}
+          TWITTER_COOKIE: ${{ secrets.TWITTER_COOKIE }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" != "all" ]; then
             cd scripts && node generate-feed.js --${{ inputs.mode }}
