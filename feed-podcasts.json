@@ -1,8 +1,9 @@
 {
-  "generatedAt": "2026-04-14T08:42:17.279Z",
+  "generatedAt": "2026-04-14T09:47:21.398Z",
   "lookbackHours": 336,
   "podcasts": [],
   "stats": {
     "podcastEpisodes": 0
-  }
+  },
+  "errors": []
 }

@@ -1,9 +1,10 @@
 {
-  "generatedAt": "2026-04-14T08:42:15.257Z",
+  "generatedAt": "2026-04-14T09:47:20.527Z",
   "lookbackHours": 24,
   "x": [],
   "stats": {
     "xBuilders": 0,
     "totalTweets": 0
-  }
+  },
+  "errors": []
 }
