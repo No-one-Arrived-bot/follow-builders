@@ -3,9 +3,7 @@
 // ============================================================================
 // Follow Builders — Central Feed Generator (Upgraded Version)
 // ============================================================================
-// Upgraded to use AssemblyAI for Podcasts and Apify for Twitter to bypass
-// deprecated services and API tier limitations.
-//
+// Uses AssemblyAI for podcast transcription and Apify for Twitter scraping.
 // Env vars needed: APIFY_API_TOKEN, ASSEMBLYAI_API_KEY
 // ============================================================================
 
@@ -19,7 +17,7 @@ const APIFY_RUN_URL = 'https://api.apify.com/v2/acts/apidojo~tweet-scraper/runs'
 const RSS_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 const TWEET_LOOKBACK_HOURS = 24;
-const PODCAST_LOOKBACK_HOURS = 336;
+const PODCAST_LOOKBACK_HOURS = 336; // 14 days
 const MAX_TWEETS_PER_USER = 3;
 
 const SCRIPT_DIR = decodeURIComponent(new URL('.', import.meta.url).pathname);
@@ -31,6 +29,8 @@ async function loadState() {
   try {
     const state = JSON.parse(await readFile(STATE_PATH, 'utf-8'));
     if (!state.seenArticles) state.seenArticles = {};
+    if (!state.seenVideos) state.seenVideos = {};
+    if (!state.seenTweets) state.seenTweets = {};
     return state;
   } catch {
     return { seenTweets: {}, seenVideos: {}, seenArticles: {} };
@@ -41,7 +41,7 @@ async function saveState(state) {
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
   for (const [id, ts] of Object.entries(state.seenTweets)) { if (ts < cutoff) delete state.seenTweets[id]; }
   for (const [id, ts] of Object.entries(state.seenVideos)) { if (ts < cutoff) delete state.seenVideos[id]; }
-  for (const [id, ts] of Object.entries(state.seenArticles || {})) { if (ts < cutoff) delete state.seenArticles[id]; }
+  for (const [id, ts] of Object.entries(state.seenArticles)) { if (ts < cutoff) delete state.seenArticles[id]; }
   await writeFile(STATE_PATH, JSON.stringify(state, null, 2));
 }
 
@@ -70,7 +70,6 @@ function parseRssFeed(xml) {
     const linkMatch = block.match(/<link>([\s\S]*?)<\/link>/);
     const link = linkMatch ? linkMatch[1].trim() : null;
 
-    // Extract mp3 audio URL from <enclosure> tag for AssemblyAI
     const enclosureMatch = block.match(/<enclosure[^>]*url="([^"]+)"/i);
     const audioUrl = enclosureMatch ? enclosureMatch[1].trim() : null;
 
@@ -83,25 +82,23 @@ function parseRssFeed(xml) {
 
 async function fetchAssemblyAITranscript(audioUrl, apiKey) {
   try {
-    // 1. Submit audio URL to AssemblyAI
-    let res = await fetch(`${ASSEMBLYAI_BASE}/transcript`, {
+    const submitRes = await fetch(`${ASSEMBLYAI_BASE}/transcript`, {
       method: 'POST',
       headers: { 'authorization': apiKey, 'content-type': 'application/json' },
       body: JSON.stringify({ audio_url: audioUrl, speech_model: 'universal-2' })
     });
-    let data = await res.json();
-    if (data.error) return { error: data.error };
-    const transcriptId = data.id;
+    const submitData = await submitRes.json();
+    if (submitData.error) return { error: submitData.error };
+    const transcriptId = submitData.id;
 
-    // 2. Poll for completion (max ~3 mins, 20 attempts × 10s)
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 10000));
-      res = await fetch(`${ASSEMBLYAI_BASE}/transcript/${transcriptId}`, {
+      const pollRes = await fetch(`${ASSEMBLYAI_BASE}/transcript/${transcriptId}`, {
         headers: { 'authorization': apiKey }
       });
-      data = await res.json();
-      if (data.status === 'completed') return { transcript: data.text };
-      if (data.status === 'error') return { error: data.error };
+      const pollData = await pollRes.json();
+      if (pollData.status === 'completed') return { transcript: pollData.text };
+      if (pollData.status === 'error') return { error: pollData.error };
       console.error(`      AssemblyAI: processing (${i + 1}/20)...`);
     }
     return { error: 'Timeout waiting for transcript' };
@@ -149,13 +146,14 @@ async function fetchPodcastContent(podcasts, apiKey, state, errors) {
     const result = await fetchAssemblyAITranscript(selected.audioUrl, apiKey);
 
     if (result.error || !result.transcript) {
-      console.error(`    Transcript error: ${result.error || 'empty'}, skipping...`);
+      // Do NOT mark seenVideos on failure — allow retry next run
+      console.error(`    Transcript error: ${result.error || 'empty'}, will retry next run`);
       continue;
     }
 
     state.seenVideos[selected.guid] = Date.now();
     return [{
-      source: "podcast",
+      source: 'podcast',
       name: selected.podcast.name,
       title: selected.title,
       guid: selected.guid,
@@ -168,36 +166,50 @@ async function fetchPodcastContent(podcasts, apiKey, state, errors) {
 }
 
 // -- X/Twitter Fetching (Apify async run) ------------------------------------
+
+// Extract handle from tweet URL — most reliable regardless of actor field naming
+// e.g. https://x.com/swyx/status/123 → "swyx"
+function extractHandleFromUrl(tweet) {
+  const url = tweet.url || tweet.twitterUrl || tweet.tweetUrl || '';
+  const match = url.match(/(?:x|twitter)\.com\/([^/?#]+)\/status\//i);
+  if (match && match[1] !== 'i') return match[1].toLowerCase();
+  // Fallback: try common nested and flat field paths
+  return (
+    tweet.author?.userName ||
+    tweet.author?.username ||
+    tweet.author?.screenName ||
+    tweet.user?.screen_name ||
+    tweet.user?.userName ||
+    tweet.screenName ||
+    tweet.userName ||
+    tweet.username
+  )?.toLowerCase() || null;
+}
+
 async function fetchXContent(xAccounts, apifyToken, state, errors) {
   const results = [];
   const cutoff = new Date(Date.now() - TWEET_LOOKBACK_HOURS * 60 * 60 * 1000);
   const handles = xAccounts.map(a => a.handle);
 
   try {
-    // 1. Submit async run to Apify
     console.error(`  Triggering Apify Twitter Scraper for ${handles.length} handles...`);
     const runRes = await fetch(`${APIFY_RUN_URL}?token=${apifyToken}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        twitterHandles: handles,
-        maxItems: handles.length * 5
-      })
+      body: JSON.stringify({ twitterHandles: handles, maxItems: handles.length * 5 })
     });
 
     if (!runRes.ok) throw new Error(`Apify run start failed: HTTP ${runRes.status}`);
     const runData = await runRes.json();
     const runId = runData.data?.id;
-    if (!runId) throw new Error('Apify did not return a run ID');
+    if (!runId) throw new Error(`Apify did not return a run ID: ${JSON.stringify(runData)}`);
     console.error(`  Apify run started: ${runId}`);
 
-    // 2. Poll for run completion (max ~5 mins, 30 attempts × 10s)
+    // Poll for completion (max ~5 mins)
     let status = 'RUNNING';
     for (let i = 0; i < 30 && (status === 'RUNNING' || status === 'READY'); i++) {
       await new Promise(r => setTimeout(r, 10000));
-      const statusRes = await fetch(
-        `https://api.apify.com/v2/actor-runs/${runId}?token=${apifyToken}`
-      );
+      const statusRes = await fetch(`https://api.apify.com/v2/actor-runs/${runId}?token=${apifyToken}`);
       const statusData = await statusRes.json();
       status = statusData.data?.status;
       console.error(`    Apify status: ${status} (${i + 1}/30)`);
@@ -205,7 +217,6 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
 
     if (status !== 'SUCCEEDED') throw new Error(`Apify run ended with status: ${status}`);
 
-    // 3. Fetch dataset results
     const datasetRes = await fetch(
       `https://api.apify.com/v2/actor-runs/${runId}/dataset/items?token=${apifyToken}`
     );
@@ -213,32 +224,28 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
     const data = await datasetRes.json();
     console.error(`  Apify returned ${data.length} raw tweets`);
 
-    // 4. Group by author — try multiple field paths for robustness
+    // Debug: show structure of first tweet to aid future debugging
     if (data.length > 0) {
-      const sample = data[0];
-      const authorKeys = Object.keys(sample.author || sample.user || {});
-      console.error(`  Apify tweet top-level keys: ${Object.keys(sample).join(", ")}`);
-      console.error(`  Apify sample author keys: ${authorKeys.join(", ")}`);
+      const s = data[0];
+      console.error(`  Sample top-level keys: ${Object.keys(s).join(', ')}`);
+      console.error(`  Sample url field: ${s.url || s.twitterUrl || s.tweetUrl || '(none)'}`);
+      console.error(`  Sample handle extracted: ${extractHandleFromUrl(s) || '(failed)'}`);
     }
-    const tweetsByAuthor = {};
-    for (const t of data) {
-      const handle = (
-        t.author?.userName ||
-        t.author?.username ||
-        t.user?.screen_name ||
-        t.user?.userName ||
-        (t.twitterUrl || t.url || "").split("/")[3]
-      )?.toLowerCase();
-      if (!handle) continue;
-      if (!tweetsByAuthor[handle]) tweetsByAuthor[handle] = [];
-      tweetsByAuthor[handle].push(t);
-    }
-    console.error(`  Matched handles: ${Object.keys(tweetsByAuthor).slice(0, 5).join(", ") || "none"}`);
 
-    // 5. Filter and build output per account
+    // Group by handle extracted from tweet URL
+    const tweetsByHandle = {};
+    for (const t of data) {
+      const handle = extractHandleFromUrl(t);
+      if (!handle) continue;
+      if (!tweetsByHandle[handle]) tweetsByHandle[handle] = [];
+      tweetsByHandle[handle].push(t);
+    }
+    console.error(`  Handles found: ${Object.keys(tweetsByHandle).join(', ') || 'none'}`);
+
+    // Build output per account
     for (const account of xAccounts) {
       const handleLower = account.handle.toLowerCase();
-      const allTweets = tweetsByAuthor[handleLower] || [];
+      const allTweets = tweetsByHandle[handleLower] || [];
       const newTweets = [];
 
       for (const t of allTweets) {
@@ -251,8 +258,8 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
           id: t.id,
           text: t.fullText || t.text,
           createdAt: t.createdAt,
-          url: t.url,
-          likes: t.likeCount || 0,
+          url: t.url || t.twitterUrl || t.tweetUrl,
+          likes: t.likeCount || t.favoriteCount || 0,
           retweets: t.retweetCount || 0,
           replies: t.replyCount || 0,
           isQuote: t.isQuote || false,
@@ -266,7 +273,7 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
           source: 'x',
           name: account.name,
           handle: account.handle,
-          bio: allTweets[0]?.author?.description || '',
+          bio: allTweets[0]?.author?.description || allTweets[0]?.author?.bio || '',
           tweets: newTweets
         });
       }
