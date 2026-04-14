@@ -147,15 +147,15 @@ async function fetchPodcastContent(podcasts, apiKey, state, errors) {
   for (const selected of withinWindow) {
     console.error(`    Fetching transcript via AssemblyAI for "${selected.title}"...`);
     const result = await fetchAssemblyAITranscript(selected.audioUrl, apiKey);
-    state.seenVideos[selected.guid] = Date.now();
 
     if (result.error || !result.transcript) {
       console.error(`    Transcript error: ${result.error || 'empty'}, skipping...`);
       continue;
     }
 
+    state.seenVideos[selected.guid] = Date.now();
     return [{
-      source: 'podcast',
+      source: "podcast",
       name: selected.podcast.name,
       title: selected.title,
       guid: selected.guid,
@@ -217,6 +217,7 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
     if (data.length > 0) {
       const sample = data[0];
       const authorKeys = Object.keys(sample.author || sample.user || {});
+      console.error(`  Apify tweet top-level keys: ${Object.keys(sample).join(", ")}`);
       console.error(`  Apify sample author keys: ${authorKeys.join(", ")}`);
     }
     const tweetsByAuthor = {};
