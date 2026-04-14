@@ -197,7 +197,7 @@ async function fetchXContent(xAccounts, apifyToken, state, errors) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        startUrls: handles.map(h => ({ url: `https://x.com/${h}` })),
+        startUrls: handles.map(h => ({ url: `https://x.com/search?q=from%3A${h}&f=live` })),
         maxItems: handles.length * 5,
         addUserInfo: true
       })
