@@ -2,26 +2,13 @@ name: Generate Feeds
 
 on:
   schedule:
-    # All feeds (tweets, podcasts, blogs): once daily at 6am UTC
+    # Run daily at midnight UTC (= 8am Beijing time)
     - cron: '0 0 * * *'
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'What to fetch'
-        required: false
-        default: 'all'
-        type: choice
-        options:
-          - all
-          - tweets-only
-          - podcasts-only
-          - blogs-only
 
 jobs:
   generate:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
       contents: write
 
@@ -36,20 +23,12 @@ jobs:
         run: cd scripts && npm install
 
       - name: Generate feeds
-        env:
-          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
-          TWITTER_COOKIE: ${{ secrets.TWITTER_COOKIE }}
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" != "all" ]; then
-            cd scripts && node generate-feed.js --${{ inputs.mode }}
-          else
-            cd scripts && node generate-feed.js
-          fi
+        run: cd scripts && node generate-feed.js
 
       - name: Commit and push feeds
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add feed-x.json feed-podcasts.json feed-blogs.json state-feed.json
+          git add feed-x.json state-feed.json
           git diff --cached --quiet || git commit -m "chore: update feeds [skip ci]"
           git push
